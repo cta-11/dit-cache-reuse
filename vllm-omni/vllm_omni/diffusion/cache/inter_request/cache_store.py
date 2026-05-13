@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CacheKey:
+    prompt: str
+    negative_prompt: str
+    height: int
+    width: int
+    num_inference_steps: int
+    guidance_scale: float
+    true_cfg_scale: float
+    seed: int
+    sigmas: tuple[float, ...] | None
+    max_sequence_length: int | None
+    num_images_per_prompt: int
+
+    def to_hash(self) -> str:
+        data = {
+            "prompt": self.prompt,
+            "negative_prompt": self.negative_prompt,
+            "height": self.height,
+            "width": self.width,
+            "num_inference_steps": self.num_inference_steps,
+            "guidance_scale": self.guidance_scale,
+            "true_cfg_scale": self.true_cfg_scale,
+            "seed": self.seed,
+            "sigmas": list(self.sigmas) if self.sigmas is not None else None,
+            "max_sequence_length": self.max_sequence_length,
+            "num_images_per_prompt": self.num_images_per_prompt,
+        }
+        serialized = json.dumps(data, sort_keys=True)
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+@dataclass
+class CacheEntry:
+    latents: torch.Tensor
+    cache_key_hash: str
+    metadata: dict[str, Any] | None = None
+
+
+class DiTCacheStore:
+    def __init__(self, max_entries: int = 100, max_memory_gb: float = 4.0):
+        self._store: OrderedDict[str, CacheEntry] = OrderedDict()
+        self._max_entries = max_entries
+        self._max_memory_bytes = max_memory_gb * 1024**3
+        self._current_memory_bytes = 0
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def _estimate_tensor_bytes(self, tensor: torch.Tensor) -> int:
+        return tensor.nelement() * tensor.element_size()
+
+    def _evict_if_needed(self, required_bytes: int):
+        while (
+            len(self._store) >= self._max_entries
+            or (self._current_memory_bytes + required_bytes > self._max_memory_bytes and len(self._store) > 0)
+        ):
+            oldest_key, oldest_entry = self._store.popitem(last=False)
+            freed = self._estimate_tensor_bytes(oldest_entry.latents)
+            self._current_memory_bytes -= freed
+            logger.debug(
+                "Evicted cache entry %s, freed %.2f MB",
+                oldest_key[:8],
+                freed / 1024**2,
+            )
+
+    def put(self, key: CacheKey, latents: torch.Tensor, metadata: dict[str, Any] | None = None):
+        key_hash = key.to_hash()
+        tensor_bytes = self._estimate_tensor_bytes(latents)
+
+        with self._lock:
+            if key_hash in self._store:
+                old_entry = self._store[key_hash]
+                self._current_memory_bytes -= self._estimate_tensor_bytes(old_entry.latents)
+                del self._store[key_hash]
+
+            self._evict_if_needed(tensor_bytes)
+
+            cached_latents = latents.detach().clone().cpu()
+            entry = CacheEntry(
+                latents=cached_latents,
+                cache_key_hash=key_hash,
+                metadata=metadata,
+            )
+            self._store[key_hash] = entry
+            self._current_memory_bytes += tensor_bytes
+
+            logger.info(
+                "Cached DiT state for key %s, size %.2f MB, total cache %.2f MB / %d entries",
+                key_hash[:8],
+                tensor_bytes / 1024**2,
+                self._current_memory_bytes / 1024**2,
+                len(self._store),
+            )
+
+    def get(self, key: CacheKey, target_device: torch.device | str | None = None) -> torch.Tensor | None:
+        key_hash = key.to_hash()
+
+        with self._lock:
+            entry = self._store.get(key_hash)
+            if entry is None:
+                self._misses += 1
+                logger.debug("Cache MISS for key %s", key_hash[:8])
+                return None
+
+            self._store.move_to_end(key_hash)
+            self._hits += 1
+
+            latents = entry.latents
+            if target_device is not None:
+                latents = latents.to(device=target_device)
+            else:
+                latents = latents.clone()
+
+            logger.info(
+                "Cache HIT for key %s (hits=%d, misses=%d, hit_rate=%.2f%%)",
+                key_hash[:8],
+                self._hits,
+                self._misses,
+                self.hit_rate * 100,
+            )
+            return latents
+
+    @property
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        if total == 0:
+            return 0.0
+        return self._hits / total
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+    @property
+    def memory_usage_mb(self) -> float:
+        with self._lock:
+            return self._current_memory_bytes / 1024**2
+
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+            self._current_memory_bytes = 0
+            self._hits = 0
+            self._misses = 0
+            logger.info("DiT cache store cleared")
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "entries": len(self._store),
+                "max_entries": self._max_entries,
+                "memory_mb": self._current_memory_bytes / 1024**2,
+                "max_memory_gb": self._max_memory_bytes / 1024**3,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": self.hit_rate,
+            }
+
+
+def build_cache_key_from_request(
+    req: Any,
+    pipeline: Any,
+) -> CacheKey | None:
+    try:
+        prompts = req.prompts
+        if not prompts:
+            return None
+
+        prompt_text = ""
+        negative_prompt_text = ""
+        if isinstance(prompts[0], str):
+            prompt_text = prompts[0]
+        elif isinstance(prompts[0], dict):
+            prompt_text = prompts[0].get("prompt", "")
+            negative_prompt_text = prompts[0].get("negative_prompt", "") or ""
+
+        sampling = req.sampling_params
+
+        height = sampling.height
+        width = sampling.width
+        if height is None and hasattr(pipeline, "default_sample_size"):
+            vae_sf = getattr(pipeline, "vae_scale_factor", 8)
+            height = pipeline.default_sample_size * vae_sf
+        if width is None and hasattr(pipeline, "default_sample_size"):
+            vae_sf = getattr(pipeline, "vae_scale_factor", 8)
+            width = pipeline.default_sample_size * vae_sf
+
+        num_inference_steps = sampling.num_inference_steps or 50
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
+        true_cfg_scale = sampling.true_cfg_scale or 1.0
+        seed = sampling.seed if sampling.seed is not None else -1
+        if seed == -1 and sampling.generator is not None:
+            try:
+                if isinstance(sampling.generator, torch.Generator):
+                    seed = sampling.generator.initial_seed()
+            except Exception:
+                pass
+
+        sigmas = tuple(sampling.sigmas) if sampling.sigmas is not None else None
+        max_sequence_length = sampling.max_sequence_length
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+
+        return CacheKey(
+            prompt=prompt_text,
+            negative_prompt=negative_prompt_text,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
+            seed=seed,
+            sigmas=sigmas,
+            max_sequence_length=max_sequence_length,
+            num_images_per_prompt=num_images_per_prompt,
+        )
+    except Exception as e:
+        logger.warning("Failed to build cache key: %s", e)
+        return None
