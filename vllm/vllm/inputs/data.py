@@ -1,0 +1,68 @@
+from vllm.inputs.llm import (
+    DataPrompt,
+    EmbedsPrompt,
+    ExplicitEncoderDecoderPrompt,
+    ModalityData,
+    MultiModalDataBuiltins,
+    MultiModalDataDict,
+    MultiModalUUIDDict,
+    PromptType,
+    SingletonPrompt,
+    TextPrompt,
+    TokensPrompt,
+)
+from vllm.inputs.engine import (
+    DecoderOnlyEngineInput,
+    EmbedsInput,
+    EncoderDecoderInput,
+    EngineInput,
+    MultiModalEncDecInput,
+    MultiModalHashes,
+    MultiModalInput,
+    MultiModalPlaceholders,
+    SingletonInput,
+    TokensInput,
+    build_enc_dec_input,
+    embeds_input,
+    mm_enc_dec_input,
+    mm_input,
+    split_enc_dec_input,
+    tokens_input,
+)
+
+TokenInputs = TokensInput
+EmbedsInputs = EmbedsInput
+SingletonInputs = SingletonInput
+MultiModalInputs = MultiModalInput
+
+__all__ = [
+    "ModalityData",
+    "MultiModalDataBuiltins",
+    "MultiModalDataDict",
+    "MultiModalUUIDDict",
+    "DataPrompt",
+    "TextPrompt",
+    "TokensPrompt",
+    "PromptType",
+    "SingletonPrompt",
+    "ExplicitEncoderDecoderPrompt",
+    "EmbedsPrompt",
+    "MultiModalHashes",
+    "MultiModalPlaceholders",
+    "TokensInput",
+    "TokenInputs",
+    "EmbedsInput",
+    "EmbedsInputs",
+    "MultiModalInput",
+    "MultiModalEncDecInput",
+    "tokens_input",
+    "embeds_input",
+    "mm_input",
+    "mm_enc_dec_input",
+    "build_enc_dec_input",
+    "split_enc_dec_input",
+    "DecoderOnlyEngineInput",
+    "EncoderDecoderInput",
+    "SingletonInput",
+    "EngineInput",
+]
