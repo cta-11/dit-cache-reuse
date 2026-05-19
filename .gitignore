@@ -12,7 +12,7 @@ vllm-ascend/log/
 vllm-omni/resume_test*.png
 
 # Chorus PDF
-chorus.pdf
+*.pdf
 
 # vllm source directory (not part of this project)
 vllm/
