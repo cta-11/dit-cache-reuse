@@ -46,9 +46,17 @@ class CacheKey:
 
 
 @dataclass
+class StepLatentData:
+    step_index: int
+    timestep: float
+    latent: torch.Tensor
+
+
+@dataclass
 class CacheEntry:
     latents: torch.Tensor
     cache_key_hash: str
+    step_latents: list[StepLatentData] | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -65,13 +73,22 @@ class DiTCacheStore:
     def _estimate_tensor_bytes(self, tensor: torch.Tensor) -> int:
         return tensor.nelement() * tensor.element_size()
 
+    def _estimate_step_latents_bytes(self, step_latents: list[StepLatentData]) -> int:
+        return sum(self._estimate_tensor_bytes(s.latent) for s in step_latents)
+
+    def _estimate_entry_bytes(self, entry: CacheEntry) -> int:
+        total = self._estimate_tensor_bytes(entry.latents)
+        if entry.step_latents is not None:
+            total += self._estimate_step_latents_bytes(entry.step_latents)
+        return total
+
     def _evict_if_needed(self, required_bytes: int):
         while (
             len(self._store) >= self._max_entries
             or (self._current_memory_bytes + required_bytes > self._max_memory_bytes and len(self._store) > 0)
         ):
             oldest_key, oldest_entry = self._store.popitem(last=False)
-            freed = self._estimate_tensor_bytes(oldest_entry.latents)
+            freed = self._estimate_entry_bytes(oldest_entry)
             self._current_memory_bytes -= freed
             logger.debug(
                 "Evicted cache entry %s, freed %.2f MB",
@@ -79,31 +96,52 @@ class DiTCacheStore:
                 freed / 1024**2,
             )
 
-    def put(self, key: CacheKey, latents: torch.Tensor, metadata: dict[str, Any] | None = None):
+    def put(
+        self,
+        key: CacheKey,
+        latents: torch.Tensor,
+        step_latents: list[StepLatentData] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
         key_hash = key.to_hash()
         tensor_bytes = self._estimate_tensor_bytes(latents)
+        if step_latents is not None:
+            tensor_bytes += self._estimate_step_latents_bytes(step_latents)
 
         with self._lock:
             if key_hash in self._store:
                 old_entry = self._store[key_hash]
-                self._current_memory_bytes -= self._estimate_tensor_bytes(old_entry.latents)
+                self._current_memory_bytes -= self._estimate_entry_bytes(old_entry)
                 del self._store[key_hash]
 
             self._evict_if_needed(tensor_bytes)
 
             cached_latents = latents.detach().clone().cpu()
+            cached_step_latents = None
+            if step_latents is not None:
+                cached_step_latents = [
+                    StepLatentData(
+                        step_index=s.step_index,
+                        timestep=s.timestep,
+                        latent=s.latent.detach().clone().cpu(),
+                    )
+                    for s in step_latents
+                ]
             entry = CacheEntry(
                 latents=cached_latents,
                 cache_key_hash=key_hash,
+                step_latents=cached_step_latents,
                 metadata=metadata,
             )
             self._store[key_hash] = entry
             self._current_memory_bytes += tensor_bytes
 
+            num_steps = len(cached_step_latents) if cached_step_latents is not None else 0
             logger.info(
-                "Cached DiT state for key %s, size %.2f MB, total cache %.2f MB / %d entries",
+                "Cached DiT state for key %s, size %.2f MB (final + %d steps), total cache %.2f MB / %d entries",
                 key_hash[:8],
                 tensor_bytes / 1024**2,
+                num_steps,
                 self._current_memory_bytes / 1024**2,
                 len(self._store),
             )
@@ -135,6 +173,36 @@ class DiTCacheStore:
                 self.hit_rate * 100,
             )
             return latents
+
+    def get_step_latents(
+        self, key: CacheKey, target_device: torch.device | str | None = None
+    ) -> list[StepLatentData] | None:
+        key_hash = key.to_hash()
+
+        with self._lock:
+            entry = self._store.get(key_hash)
+            if entry is None or entry.step_latents is None:
+                return None
+
+            self._store.move_to_end(key_hash)
+
+            if target_device is not None:
+                return [
+                    StepLatentData(
+                        step_index=s.step_index,
+                        timestep=s.timestep,
+                        latent=s.latent.to(device=target_device),
+                    )
+                    for s in entry.step_latents
+                ]
+            return [
+                StepLatentData(
+                    step_index=s.step_index,
+                    timestep=s.timestep,
+                    latent=s.latent.clone(),
+                )
+                for s in entry.step_latents
+            ]
 
     @property
     def hit_rate(self) -> float:

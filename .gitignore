@@ -4,3 +4,15 @@
 **/build/
 **/dist/
 **/*.egg-info/
+
+# Log directories
+vllm-ascend/log/
+
+# Test output images
+vllm-omni/resume_test*.png
+
+# Chorus PDF
+chorus.pdf
+
+# vllm source directory (not part of this project)
+vllm/

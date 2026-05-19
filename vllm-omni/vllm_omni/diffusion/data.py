@@ -293,6 +293,10 @@ class DiffusionCacheConfig:
     inter_request_max_entries: int = 100
     # Maximum GPU memory (in GB) for cached latents
     inter_request_max_memory_gb: float = 4.0
+    # Whether to record latents at every denoising step (first request only)
+    inter_request_record_step_latents: bool = False
+    # Directory to save step latents (subdirectory per cache key hash)
+    inter_request_step_latents_dir: str = "./step_latents"
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
