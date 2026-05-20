@@ -337,6 +337,8 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            self.model_runner.shutdown()
         destroy_distributed_env()
 
 
