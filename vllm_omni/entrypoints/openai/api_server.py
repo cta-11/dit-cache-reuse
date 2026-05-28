@@ -61,8 +61,11 @@ from vllm.entrypoints.openai.speech_to_text.serving import (
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
-from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
-from vllm.entrypoints.pooling.score.serving import ServingScores
+from vllm.entrypoints.pooling.pooling.serving import ServingPooling as OpenAIServingPooling
+try:
+    from vllm.entrypoints.pooling.score.serving import ServingScores
+except (ImportError, ModuleNotFoundError):
+    from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
@@ -1314,6 +1317,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
+        _update_if_not_none(gen_params, "resume_from_step", request.resume_from_step)
 
         request_id = f"img_gen-{random_uuid()}"
 

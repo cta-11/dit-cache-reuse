@@ -950,6 +950,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
+        resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+        resume_latents = getattr(req.sampling_params, "resume_latents", None)
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
@@ -991,6 +993,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 "return_dict": False,
                 "attention_kwargs": self.attention_kwargs,
             },
+            resume_from_step=resume_from_step,
+            resume_latents=resume_latents,
         )
 
         self._current_timestep = None

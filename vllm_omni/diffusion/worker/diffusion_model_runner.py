@@ -21,7 +21,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
+from vllm_omni.diffusion.cache.inter_request.cache_store import StepLatentData
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -257,6 +258,54 @@ class DiffusionModelRunner:
                     gen_device = self.device
                 req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
+            # Inter-request cache: check for cached DiT output before computation
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+                if resume_from_step > 0:
+                    step_latents_list = self.cache_backend.lookup_step_latents(req, target_device=self.device)
+                    if step_latents_list is not None and len(step_latents_list) >= resume_from_step:
+                        resume_data = step_latents_list[resume_from_step - 1]
+                        req.sampling_params.resume_latents = resume_data.latent
+                        logger.info(
+                            "Inter-request cache: resuming from step %d (using latent after step %d, timestep=%.1f), "
+                            "skipping first %d denoising steps",
+                            resume_from_step,
+                            resume_from_step - 1,
+                            resume_data.timestep,
+                            resume_from_step,
+                        )
+                    else:
+                        logger.warning(
+                            "Inter-request cache: resume_from_step=%d requested but only %d steps cached, "
+                            "falling back to full inference",
+                            resume_from_step,
+                            len(step_latents_list) if step_latents_list is not None else 0,
+                        )
+                        req.sampling_params.resume_from_step = 0
+                else:
+                    cached_output = self.cache_backend.lookup(req, target_device=self.device)
+                    if cached_output is not None:
+                        logger.info("Inter-request cache HIT: skipping DiT computation entirely")
+                        return DiffusionOutput(output=cached_output)
+
+                    if self.cache_backend.clip_enabled:
+                        clip_latents, clip_step_latents, clip_sim = self.cache_backend.semantic_lookup(
+                            req, target_device=self.device
+                        )
+                        if clip_latents is not None and clip_step_latents is not None:
+                            total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
+                            clip_resume_step = self.cache_backend.compute_skip_steps(clip_sim, total_steps)
+                            if clip_resume_step > 0 and len(clip_step_latents) >= clip_resume_step:
+                                resume_data = clip_step_latents[clip_resume_step - 1]
+                                req.sampling_params.resume_latents = resume_data.latent
+                                req.sampling_params.resume_from_step = clip_resume_step
+                                logger.info(
+                                    "CLIP semantic match: similarity=%.4f, resuming from step %d/%d",
+                                    clip_sim,
+                                    clip_resume_step,
+                                    total_steps,
+                                )
+
             # Refresh cache context if needed
             if (
                 not getattr(req, "skip_cache_refresh", False)
@@ -270,12 +319,51 @@ class DiffusionModelRunner:
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
+            is_dummy = "dummy" in req.request_ids[0] if req.request_ids else False
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                self.cache_backend.before_forward(is_dummy=is_dummy)
+
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
 
             if is_primary:
                 self._record_peak_memory(output)
+
+            cache_key_hash = None
+            resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+            if (
+                isinstance(self.cache_backend, InterRequestCacheBackend)
+                and self.cache_backend.is_enabled()
+                and output.output is not None
+                and not is_dummy
+                and resume_from_step == 0
+            ):
+                step_latents_data: list[StepLatentData] | None = None
+                recorder = self.cache_backend.recorder
+                if recorder is not None and recorder.num_steps > 0:
+                    step_latents_data = [
+                        StepLatentData(
+                            step_index=r.step_index,
+                            timestep=r.timestep,
+                            latent=r.latent,
+                        )
+                        for r in recorder.records
+                    ]
+                cache_key_hash = self.cache_backend.store(
+                    req, output.output, step_latents=step_latents_data
+                )
+                logger.info("Inter-request cache: stored DiT output for future reuse")
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                saved_paths = self.cache_backend.after_forward(cache_key_hash=cache_key_hash, is_dummy=is_dummy)
+                if saved_paths:
+                    logger.info(
+                        "Inter-request cache: saved %d step latents to %s",
+                        len(saved_paths),
+                        saved_paths[0] if saved_paths else "",
+                    )
 
             # NOTE:
             if (
@@ -284,6 +372,7 @@ class DiffusionModelRunner:
                 and self.od_config.cache_backend == "cache_dit"
                 and self.od_config.enable_cache_dit_summary
             ):
+                from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
                 cache_summary(self.pipeline, details=True)
 
             return output
@@ -396,3 +485,15 @@ class DiffusionModelRunner:
                     finished=finished,
                     result=result,
                 )
+
+    def shutdown(self) -> None:
+        logger.info(
+            "DiffusionModelRunner shutdown: cache_backend=%s, type=%s",
+            self.cache_backend,
+            type(self.cache_backend).__name__ if self.cache_backend else None,
+        )
+        if (
+            isinstance(self.cache_backend, InterRequestCacheBackend)
+            and self.cache_backend.is_enabled()
+        ):
+            self.cache_backend.shutdown()
