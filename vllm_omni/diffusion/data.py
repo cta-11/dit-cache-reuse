@@ -288,6 +288,18 @@ class DiffusionCacheConfig:
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
 
+    # Inter-request cache parameters [inter_request only]
+    # Maximum number of cache entries to store
+    inter_request_max_entries: int = 100
+    # Maximum GPU memory (in GB) for cached latents
+    inter_request_max_memory_gb: float = 4.0
+    # Whether to record latents at every denoising step (first request only)
+    inter_request_record_step_latents: bool = False
+    # Directory to save step latents (subdirectory per cache key hash)
+    inter_request_step_latents_dir: str = "./step_latents"
+    # Directory for persistent cache storage (enables cross-run cache reuse)
+    inter_request_persistent_cache_dir: str | None = None
+
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
 

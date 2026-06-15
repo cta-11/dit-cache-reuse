@@ -92,6 +92,11 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
     )
+    resume_from_step: int | None = Field(
+        default=None,
+        ge=0,
+        description="Resume denoising from this step using cached step latents (inter_request cache only). 0 = no resume.",
+    )
 
     # vllm-omni extension for per-request LoRA.
     # This mirrors the `extra_body.lora` convention in /v1/chat/completions.

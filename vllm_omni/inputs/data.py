@@ -292,6 +292,10 @@ class OmniDiffusionSamplingParams:
     VSA_sparsity: float = 0.0
     # perf_logger: PerformanceLogger | None = None
 
+    # Inter-request cache: resume from a cached denoising step
+    resume_from_step: int = 0
+    resume_latents: torch.Tensor | None = None
+
     # stage logging
     # logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
 

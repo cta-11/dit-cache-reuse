@@ -91,10 +91,11 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
+        choices=["cache_dit", "tea_cache", "inter_request"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache), "
+            "'inter_request' (cross-request DiT state reuse, Chorus Stage-1). "
             "Default: None (no cache acceleration)."
         ),
     )
@@ -102,6 +103,29 @@ def parse_args() -> argparse.Namespace:
         "--enable-cache-dit-summary",
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
+    parser.add_argument(
+        "--record-step-latents",
+        action="store_true",
+        help="Record and save latents at every denoising step (inter_request cache only).",
+    )
+    parser.add_argument(
+        "--step-latents-dir",
+        type=str,
+        default="./step_latents",
+        help="Directory to save per-step latents (inter_request cache only). Default: ./step_latents",
+    )
+    parser.add_argument(
+        "--resume-from-step",
+        type=int,
+        default=0,
+        help="Resume denoising from this step using cached step latents (inter_request cache only). Default: 0 (no resume)",
+    )
+    parser.add_argument(
+        "--persistent-cache-dir",
+        type=str,
+        default=None,
+        help="Directory to persist cache to disk for cross-run reuse (inter_request cache only). Default: None (in-memory only)",
     )
     parser.add_argument(
         "--ulysses-degree",
@@ -279,6 +303,14 @@ def main():
             # Note: coefficients will use model-specific defaults based on model_type
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
+    elif cache_backend == "inter_request":
+        cache_config = {
+            "inter_request_max_entries": 100,
+            "inter_request_max_memory_gb": 4.0,
+            "inter_request_record_step_latents": args.record_step_latents,
+            "inter_request_step_latents_dir": args.step_latents_dir,
+            "inter_request_persistent_cache_dir": args.persistent_cache_dir,
+        }
 
     # assert args.ring_degree == 1, "Ring attention is not supported yet"
     parallel_config = DiffusionParallelConfig(
@@ -333,6 +365,7 @@ def main():
         "mode": "text-to-image",
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
+        "init_timeout": 1200,
         **lora_args,
         **quant_kwargs,
     }
@@ -401,7 +434,7 @@ def main():
         OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
-            generator=generator,
+            seed=args.seed,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
             guidance_scale_2=args.guidance_scale_2,
@@ -414,8 +447,68 @@ def main():
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
-    # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+
+    outputs_reuse = None
+    outputs_resume = None
+    if cache_backend == "inter_request":
+        print(f"\n{'=' * 60}")
+        print("Inter-request cache: Sending identical request to verify cache reuse...")
+        print(f"{'=' * 60}")
+        reuse_start = time.perf_counter()
+        outputs_reuse = omni.generate(
+            {
+                "prompt": args.prompt,
+                "negative_prompt": args.negative_prompt,
+            },
+            OmniDiffusionSamplingParams(
+                height=args.height,
+                width=args.width,
+                seed=args.seed,
+                true_cfg_scale=args.cfg_scale,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps,
+                num_outputs_per_prompt=args.num_images_per_prompt,
+                extra_args=extra_args,
+            ),
+        )
+        reuse_end = time.perf_counter()
+        reuse_time = reuse_end - reuse_start
+        print(f"Reuse generation time: {reuse_time:.4f} seconds ({reuse_time * 1000:.2f} ms)")
+        print(f"Speedup: {generation_time / reuse_time:.2f}x")
+        if reuse_time < generation_time * 0.5:
+            print("Cache HIT confirmed! DiT computation was skipped.")
+        else:
+            print("Cache MISS - DiT computation was not skipped. Check logs for details.")
+
+        if args.resume_from_step > 0:
+            print(f"\n{'=' * 60}")
+            print(f"Inter-request cache: Resuming from step {args.resume_from_step}...")
+            print(f"{'=' * 60}")
+            resume_start = time.perf_counter()
+            outputs_resume = omni.generate(
+                {
+                    "prompt": args.prompt,
+                    "negative_prompt": args.negative_prompt,
+                },
+                OmniDiffusionSamplingParams(
+                    height=args.height,
+                    width=args.width,
+                    seed=args.seed,
+                    true_cfg_scale=args.cfg_scale,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.num_inference_steps,
+                    num_outputs_per_prompt=args.num_images_per_prompt,
+                    resume_from_step=args.resume_from_step,
+                    extra_args=extra_args,
+                ),
+            )
+            resume_end = time.perf_counter()
+            resume_time = resume_end - resume_start
+            print(f"Resume generation time: {resume_time:.4f} seconds ({resume_time * 1000:.2f} ms)")
+            print(f"Resume speedup vs full: {generation_time / resume_time:.2f}x")
+            expected_ratio = 1 - args.resume_from_step / args.num_inference_steps
+            print(f"Expected time ratio (skipped steps): {expected_ratio:.2f}")
 
     if profiler_enabled:
         print("\n[Profiler] Stopping profiler and collecting results...")
@@ -455,14 +548,37 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".png"
     stem = output_path.stem or "qwen_image_output"
-    if len(images) <= 1:
-        images[0].save(output_path)
-        print(f"Saved generated image to {output_path}")
+
+    first_images = images
+    first_save_path = output_path.parent / f"{stem}_first{suffix}"
+    first_images[0].save(first_save_path)
+    print(f"Saved first generation image to {first_save_path}")
+
+    if cache_backend == "inter_request" and outputs_reuse is not None:
+        reuse_output = outputs_reuse[0]
+        if hasattr(reuse_output, "request_output") and reuse_output.request_output is not None:
+            reuse_req_out = reuse_output.request_output
+            if hasattr(reuse_req_out, "images") and reuse_req_out.images:
+                reuse_images = reuse_req_out.images
+                reuse_save_path = output_path.parent / f"{stem}_cached{suffix}"
+                reuse_images[0].save(reuse_save_path)
+                print(f"Saved cache-reuse image to {reuse_save_path}")
+
+    if cache_backend == "inter_request" and outputs_resume is not None:
+        resume_output = outputs_resume[0]
+        if hasattr(resume_output, "request_output") and resume_output.request_output is not None:
+            resume_req_out = resume_output.request_output
+            if hasattr(resume_req_out, "images") and resume_req_out.images:
+                resume_images = resume_req_out.images
+                resume_save_path = output_path.parent / f"{stem}_resume_step{args.resume_from_step}{suffix}"
+                resume_images[0].save(resume_save_path)
+                print(f"Saved resume-from-step image to {resume_save_path}")
     else:
-        for idx, img in enumerate(images):
-            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-            img.save(save_path)
-            print(f"Saved generated image to {save_path}")
+        if len(first_images) > 1:
+            for idx in range(1, len(first_images)):
+                save_path = output_path.parent / f"{stem}_first_{idx}{suffix}"
+                first_images[idx].save(save_path)
+                print(f"Saved generated image to {save_path}")
 
 
 if __name__ == "__main__":
