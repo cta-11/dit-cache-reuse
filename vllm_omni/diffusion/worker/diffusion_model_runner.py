@@ -14,7 +14,6 @@ import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 from torch.profiler import record_function
@@ -22,7 +21,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
+from vllm_omni.diffusion.cache.inter_request.cache_store import StepLatentData
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -33,16 +33,14 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
+class DiffusionModelRunner:
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -212,7 +210,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
-        logger.debug(
+        logger.info(
             "Peak GPU memory (this request): %.2f GB reserved, %.2f GB allocated, %.2f GB pool overhead (%.1f%%)",
             peak_reserved_gb,
             peak_allocated_gb,
@@ -260,37 +258,71 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     gen_device = self.device
                 req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
+            # Inter-request cache: check for cached DiT output before computation
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+                if resume_from_step > 0:
+                    step_latents_list = self.cache_backend.lookup_step_latents(req, target_device=self.device)
+                    if step_latents_list is not None and len(step_latents_list) >= resume_from_step:
+                        resume_data = step_latents_list[resume_from_step - 1]
+                        req.sampling_params.resume_latents = resume_data.latent
+                        logger.info(
+                            "Inter-request cache: resuming from step %d (using latent after step %d, timestep=%.1f), "
+                            "skipping first %d denoising steps",
+                            resume_from_step,
+                            resume_from_step - 1,
+                            resume_data.timestep,
+                            resume_from_step,
+                        )
+                    else:
+                        logger.warning(
+                            "Inter-request cache: resume_from_step=%d requested but only %d steps cached, "
+                            "falling back to full inference",
+                            resume_from_step,
+                            len(step_latents_list) if step_latents_list is not None else 0,
+                        )
+                        req.sampling_params.resume_from_step = 0
+                else:
+                    cached_output = self.cache_backend.lookup(req, target_device=self.device)
+                    if cached_output is not None:
+                        logger.info("Inter-request cache HIT: skipping DiT computation entirely")
+                        return DiffusionOutput(output=cached_output)
+
+                    if self.cache_backend.clip_enabled:
+                        clip_latents, clip_step_latents, clip_sim = self.cache_backend.semantic_lookup(
+                            req, target_device=self.device
+                        )
+                        if clip_latents is not None and clip_step_latents is not None:
+                            total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
+                            clip_resume_step = self.cache_backend.compute_skip_steps(clip_sim, total_steps)
+                            if clip_resume_step > 0 and len(clip_step_latents) >= clip_resume_step:
+                                resume_data = clip_step_latents[clip_resume_step - 1]
+                                req.sampling_params.resume_latents = resume_data.latent
+                                req.sampling_params.resume_from_step = clip_resume_step
+                                logger.info(
+                                    "CLIP semantic match: similarity=%.4f, resuming from step %d/%d",
+                                    clip_sim,
+                                    clip_resume_step,
+                                    total_steps,
+                                )
+
             # Refresh cache context if needed
             if (
                 not getattr(req, "skip_cache_refresh", False)
                 and self.cache_backend is not None
                 and self.cache_backend.is_enabled()
+                and req.sampling_params.num_inference_steps is not None
             ):
-                # FIXME (Alex): When num_inference_steps is None, we defer to
-                # pipelines for default, but don't refresh the cache; the right
-                # way to do this is to merge the sampling params first.
-                #
-                # For now, if num_inference_steps is not set, we pass 0 to allow
-                # TeaCache to refresh to align with the param signature. This is
-                # okay to force refresh TeaCache because the refresh does not use
-                # num_inference_steps at all (i.e., just resets state and clears
-                # stale residuals).
-                num_inference_steps = req.sampling_params.num_inference_steps
-                if self.od_config.cache_backend == "tea_cache" and num_inference_steps is None:
-                    num_inference_steps = 0
-
-                if num_inference_steps is not None:
-                    self.cache_backend.refresh(self.pipeline, num_inference_steps)
-                else:
-                    logger.warning(
-                        "Failed to refresh the diffusion transformer cache; backend %s "
-                        "currently requires num_inference_steps to be passed explicitly",
-                        self.od_config.cache_backend,
-                    )
+                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
+
+            is_dummy = "dummy" in req.request_ids[0] if req.request_ids else False
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                self.cache_backend.before_forward(is_dummy=is_dummy)
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
@@ -299,6 +331,40 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 self._record_peak_memory(output)
 
+            cache_key_hash = None
+            resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+            if (
+                isinstance(self.cache_backend, InterRequestCacheBackend)
+                and self.cache_backend.is_enabled()
+                and output.output is not None
+                and not is_dummy
+                and resume_from_step == 0
+            ):
+                step_latents_data: list[StepLatentData] | None = None
+                recorder = self.cache_backend.recorder
+                if recorder is not None and recorder.num_steps > 0:
+                    step_latents_data = [
+                        StepLatentData(
+                            step_index=r.step_index,
+                            timestep=r.timestep,
+                            latent=r.latent,
+                        )
+                        for r in recorder.records
+                    ]
+                cache_key_hash = self.cache_backend.store(
+                    req, output.output, step_latents=step_latents_data
+                )
+                logger.info("Inter-request cache: stored DiT output for future reuse")
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                saved_paths = self.cache_backend.after_forward(cache_key_hash=cache_key_hash, is_dummy=is_dummy)
+                if saved_paths:
+                    logger.info(
+                        "Inter-request cache: saved %d step latents to %s",
+                        len(saved_paths),
+                        saved_paths[0] if saved_paths else "",
+                    )
+
             # NOTE:
             if (
                 self.cache_backend is not None
@@ -306,6 +372,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and self.od_config.cache_backend == "cache_dit"
                 and self.od_config.enable_cache_dit_summary
             ):
+                from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
                 cache_summary(self.pipeline, details=True)
 
             return output
@@ -318,107 +385,50 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(
-        self, scheduler_output: DiffusionSchedulerOutput
-    ) -> tuple[list[DiffusionRequestState], list[str]]:
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[DiffusionRequestState, bool]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for req_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(req_id, None)
 
-        resolved: list[DiffusionRequestState] = []
-        new_req_id: list[str] = []
-        try:
-            # process new requests
-            for sched_new_req in scheduler_output.scheduled_new_reqs:
-                # new_req_data = scheduler_output.scheduled_new_reqs[0]
-                req_id = sched_new_req.sched_req_id
-                req = sched_new_req.req
-                new_req_id.append(req_id)
-                if req_id in self.state_cache:
-                    raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
-                request_ids = req.request_ids or [req_id]
-                if len(request_ids) != len(req.prompts):
-                    raise ValueError(
-                        f"request_ids length ({len(request_ids)}) does not match prompts length ({len(req.prompts)})"
-                    )
-                new_state = DiffusionRequestState(
-                    req_id=req_id,
-                    sampling=copy.deepcopy(req.sampling_params),
-                    prompts=req.prompts,
-                )
-                self.state_cache[req_id] = new_state
-                resolved.append(new_state)
+        if scheduler_output.num_scheduled_reqs != 1:
+            raise ValueError(
+                "Step mode currently supports batch_size=1, "
+                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
+            )
 
-            # process cached requests
-            for req_id in scheduler_output.scheduled_cached_reqs.sched_req_ids:
-                state = self.state_cache.get(req_id)
-                if state is None:
-                    raise ValueError(f"Missing cached state for request {req_id}.")
-                resolved.append(state)
-        except Exception:
-            for req_id in new_req_id:
-                self.state_cache.pop(req_id, None)
-            raise
-
-        return resolved, new_req_id
-
-    def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
-        # process new reqs
-        for state in states:
-            if state.req_id in new_request_ids:
-                # set generator
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
-                # encode
-                self.pipeline.prepare_encode(state)
-
-        input_batch = InputBatch.make_batch(
-            states,
-            cached_batch=getattr(self, "input_batch", None),
-        )
-        self.input_batch = input_batch
-        return input_batch
-
-    def _update_states_after(
-        self,
-        states: list[DiffusionRequestState],
-        input_batch: InputBatch,
-        interrupted: bool = False,
-    ):
-        """Step-after update: clear cached state for completed request."""
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
+        if scheduler_output.scheduled_new_reqs:
+            new_req_data = scheduler_output.scheduled_new_reqs[0]
+            req_id = new_req_data.sched_req_id
+            req = new_req_data.req
+            if req_id in self.state_cache:
+                raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
         else:
-            input_batch.latents = gathered_latents.clone()
+            req_id = scheduler_output.scheduled_cached_reqs.sched_req_ids[0]
+            state = self.state_cache.get(req_id)
+            if state is None:
+                raise ValueError(f"Missing cached state for request {req_id}.")
+            return state, False
 
-        self.input_batch = input_batch
-        scatter_latents(states, input_batch)
+        request_ids = req.request_ids or [req_id]
+        if len(request_ids) != len(req.prompts):
+            raise ValueError(
+                f"request_ids length ({len(request_ids)}) does not match prompts length ({len(req.prompts)})"
+            )
 
-        for state in states:
-            if interrupted or state.denoise_completed:
-                self.state_cache.pop(state.req_id, None)
+        state = DiffusionRequestState(
+            req_id=req_id,
+            sampling=copy.deepcopy(req.sampling_params),
+            prompts=req.prompts,
+        )
+        self.state_cache[req_id] = state
+        return state, True
 
-    def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
-        model_state = getattr(self, "model_state", None)
-        if model_state is None:
-            return {}
-        prepare_attn = getattr(model_state, "prepare_attn", None)
-        if not callable(prepare_attn):
-            return {}
-        return prepare_attn(input_batch)
+    def _update_states_after(self, state: DiffusionRequestState, finished: bool) -> None:
+        """Step-after update: clear cached state for completed request."""
+        if finished:
+            self.state_cache.pop(state.req_id, None)
 
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self.supports_step_mode():
@@ -432,57 +442,58 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            states, new_request_ids = self._update_states(scheduler_output)
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
+            state, is_new_request = self._update_states(scheduler_output)
 
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-            ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+            if is_new_request:
+                # TODO: support kv manager recv
+                # TODO: support cache backend
+                if state.sampling.generator is None and state.sampling.seed is not None:
+                    if state.sampling.generator_device is not None:
+                        gen_device = state.sampling.generator_device
+                    elif self.device.type == "cpu":
+                        gen_device = "cpu"
+                    else:
+                        gen_device = self.device
+                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
 
-                runner_output_list = []
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
-                    for state in states:
-                        runner_output_list.append(
-                            RunnerOutput(
-                                req_id=state.req_id,
-                                step_index=state.step_index,
-                                finished=True,
-                                result=DiffusionOutput(error="stepwise denoise interrupted"),
-                            )
-                        )
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                # step0/new request: encode
+                if is_new_request:
+                    self.pipeline.prepare_encode(state)
 
+                noise_pred = self.pipeline.denoise_step(state)
+                finished = False
+
+                # In CFG parallel mode, only rank 0 gets the actual noise_pred; non-rank-0 workers receive None.
+                # A true interrupt (all ranks return None) is detected by checking self.pipeline.interrupt.
+                if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                    finished = True
+                    result = DiffusionOutput(error="stepwise denoise interrupted")
                 else:
-                    offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                        )
-                        offset = offset + row_num
-                        if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
-                        else:
-                            result = None
-                        runner_output_list.append(
-                            RunnerOutput(
-                                req_id=req.req_id,
-                                step_index=req.step_index,
-                                finished=req.denoise_completed,
-                                result=result,
-                            )
-                        )
+                    self.pipeline.step_scheduler(state, noise_pred)
+                    finished = state.denoise_completed
+                    if finished:
+                        result = self.pipeline.post_decode(state)
+                    else:
+                        result = None
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
+                self._update_states_after(state, finished)
 
-                self._update_states_after(states, input_batch, pipeline_interrupted)
+                return RunnerOutput(
+                    req_id=state.req_id,
+                    step_index=state.step_index,
+                    finished=finished,
+                    result=result,
+                )
 
-                return BatchRunnerOutput.from_list(runner_output_list)
+    def shutdown(self) -> None:
+        logger.info(
+            "DiffusionModelRunner shutdown: cache_backend=%s, type=%s",
+            self.cache_backend,
+            type(self.cache_backend).__name__ if self.cache_backend else None,
+        )
+        if (
+            isinstance(self.cache_backend, InterRequestCacheBackend)
+            and self.cache_backend.is_enabled()
+        ):
+            self.cache_backend.shutdown()
