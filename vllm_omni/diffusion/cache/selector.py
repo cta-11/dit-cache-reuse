@@ -1,8 +1,7 @@
 from typing import Any
 
 from vllm_omni.diffusion.cache.base import CacheBackend
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
-from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
+from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 
@@ -12,14 +11,17 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     This is a selector function that routes to the appropriate backend implementation.
     - cache_dit: Uses CacheDiTBackend with enable()/refresh() interface
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
+    - inter_request: Uses InterRequestCacheBackend for cross-request DiT state reuse
+    - inter_request+cache_dit: CompositeCacheBackend combining both
 
     Args:
-        cache_backend: Cache backend name ("cache_dit", "tea_cache", or None).
+        cache_backend: Cache backend name. Supported values:
+            "cache_dit", "tea_cache", "inter_request",
+            "inter_request+cache_dit" (or "cache_dit+inter_request"), or None.
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:
-        Cache backend instance (CacheDiTBackend or TeaCacheBackend) if cache_backend is set,
-        None otherwise.
+        Cache backend instance if cache_backend is set, None otherwise.
 
     Raises:
         ValueError: If cache_backend is unsupported.
@@ -31,8 +33,19 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         cache_config = DiffusionCacheConfig.from_dict(cache_config)
 
     if cache_backend == "cache_dit":
+        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
         return CacheDiTBackend(cache_config)
     elif cache_backend == "tea_cache":
+        from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
         return TeaCacheBackend(cache_config)
+    elif cache_backend == "inter_request":
+        return InterRequestCacheBackend(cache_config)
+    elif cache_backend in ("inter_request+cache_dit", "cache_dit+inter_request"):
+        from vllm_omni.diffusion.cache.composite_backend import CompositeCacheBackend
+        return CompositeCacheBackend(cache_config)
     else:
-        raise ValueError(f"Unsupported cache backend: {cache_backend}. Supported: 'cache_dit', 'tea_cache'")
+        raise ValueError(
+            f"Unsupported cache backend: {cache_backend}. "
+            f"Supported: 'cache_dit', 'tea_cache', 'inter_request', "
+            f"'inter_request+cache_dit'"
+        )
