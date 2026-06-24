@@ -22,7 +22,6 @@ import random
 import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
 
 # Force unbuffered stdout so logs show immediately
 sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)

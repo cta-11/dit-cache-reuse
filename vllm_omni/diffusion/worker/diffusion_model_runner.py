@@ -395,7 +395,6 @@ class DiffusionModelRunner:
                         saved_paths[0] if saved_paths else "",
                     )
 
-            # NOTE:
             if (
                 self.cache_backend is not None
                 and self.cache_backend.is_enabled()

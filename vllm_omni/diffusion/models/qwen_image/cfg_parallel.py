@@ -137,7 +137,7 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
-                if step_latents_recorder is not None:
+                if step_latents_recorder is not None and step_latents_recorder._enabled:
                     step_latents_recorder.record(i, t.item(), latents)
 
                 pbar.update()

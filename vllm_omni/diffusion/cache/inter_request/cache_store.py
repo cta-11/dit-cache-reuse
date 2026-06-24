@@ -9,9 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ---- Module constants ----
+_MB = 1024**2
+_GB = 1024**3
+_SIM_STATS_PATH = "/tmp/cache_sim_stats.json"
+_SIM_STATS_FLUSH_INTERVAL = 50  # flush similarity stats to file every N searches
 
 
 @dataclass(frozen=True)
@@ -68,13 +75,14 @@ class DiTCacheStore:
     def __init__(self, max_entries: int = 100, max_memory_gb: float = 4.0):
         self._store: OrderedDict[str, CacheEntry] = OrderedDict()
         self._max_entries = max_entries
-        self._max_memory_bytes = max_memory_gb * 1024**3
+        self._max_memory_bytes = max_memory_gb * _GB
         self._current_memory_bytes = 0
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
         self._all_sims: list[float] = []  # all final_sim values across all queries
         self._all_t2t_sims: list[float] = []  # all t2t_sim values across all queries
+        self._search_count: int = 0  # throttle for _flush_sim_stats_to_file
 
         # ---- Pre-stacked embedding matrices for fast vectorized retrieval ----
         # Instead of torch.stack()-ing all embeddings on every semantic_search()
@@ -175,7 +183,7 @@ class DiTCacheStore:
             logger.debug(
                 "Evicted cache entry %s, freed %.2f MB",
                 oldest_key[:8],
-                freed / 1024**2,
+                freed / _MB,
             )
 
     def put(
@@ -228,9 +236,9 @@ class DiTCacheStore:
             logger.info(
                 "Cached DiT state for key %s, size %.2f MB (final + %d steps), total cache %.2f MB / %d entries",
                 key_hash[:8],
-                tensor_bytes / 1024**2,
+                tensor_bytes / _MB,
                 num_steps,
-                self._current_memory_bytes / 1024**2,
+                self._current_memory_bytes / _MB,
                 len(self._store),
             )
 
@@ -290,8 +298,6 @@ class DiTCacheStore:
         best_t2t = 0.0
         best_t2i = 0.0
         best_penalty = 1.0
-        query_sims: list[float] = []  # all final sims for this query
-        query_t2t_sims: list[float] = []  # all t2t sims for this query
 
         with self._lock:
             # ---- Vectorized retrieval using pre-stacked matrices ----
@@ -336,19 +342,19 @@ class DiTCacheStore:
             q_cpu = query_norm.cpu()  # [1, dim]
 
             # --- Hybrid group: sim = t2t * sigmoid_penalty(t2i) ---
+            # Embeddings already L2-normalized at encode time (backend.py),
+            # so cosine similarity = dot product directly — no re-normalization.
             if hybrid_row_idxs:
                 idx_t = torch.tensor(hybrid_row_idxs, dtype=torch.long)
                 txt_sub = self._txt_matrix.index_select(0, idx_t)   # [M, dim]
                 img_sub = self._img_matrix.index_select(0, idx_t)   # [M, dim]
-                txt_norm = txt_sub / txt_sub.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                img_norm = img_sub / img_sub.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                t2t = (q_cpu * txt_norm).sum(dim=-1)                # [M]
-                t2i = (q_cpu * img_norm).sum(dim=-1)                # [M]
-                penalty = torch.sigmoid((t2i - 0.10) * 10)          # [M]
-                sims = t2t * penalty                                # [M]
+                t2t = (q_cpu * txt_sub).sum(dim=-1)                  # [M]
+                t2i = (q_cpu * img_sub).sum(dim=-1)                  # [M]
+                penalty = torch.sigmoid((t2i - 0.10) * 10)           # [M]
+                sims = t2t * penalty                                 # [M]
 
-                query_sims.extend(sims.tolist())
-                query_t2t_sims.extend(t2t.tolist())
+                self._all_sims.extend(sims.tolist())
+                self._all_t2t_sims.extend(t2t.tolist())
                 best_local = int(torch.argmax(sims).item())
                 best_sim = float(sims[best_local].item())
                 best_row = hybrid_row_idxs[best_local]
@@ -361,12 +367,11 @@ class DiTCacheStore:
             if text_row_idxs:
                 idx_t = torch.tensor(text_row_idxs, dtype=torch.long)
                 txt_sub = self._txt_matrix.index_select(0, idx_t)   # [K, dim]
-                txt_norm = txt_sub / txt_sub.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                t2t = (q_cpu * txt_norm).sum(dim=-1)                # [K]
-                sims = t2t                                          # sim == t2t for text-only
+                t2t = (q_cpu * txt_sub).sum(dim=-1)                  # [K]
+                sims = t2t                                           # sim == t2t for text-only
 
-                query_sims.extend(sims.tolist())
-                query_t2t_sims.extend(t2t.tolist())
+                self._all_sims.extend(sims.tolist())
+                self._all_t2t_sims.extend(t2t.tolist())
                 best_local = int(torch.argmax(sims).item())
                 top_sim = float(sims[best_local].item())
                 if top_sim > best_sim:
@@ -388,9 +393,11 @@ class DiTCacheStore:
                 best_t2i = 0.0
                 best_penalty = 1.0
 
-            self._all_sims.extend(query_sims)
-            self._all_t2t_sims.extend(query_t2t_sims)
-            self._flush_sim_stats_to_file()
+            # Throttle stats flushing: only every N searches to avoid O(total)
+            # numpy computation + disk write on every single query.
+            self._search_count += 1
+            if self._search_count % _SIM_STATS_FLUSH_INTERVAL == 0:
+                self._flush_sim_stats_to_file()
 
             match_type = "hybrid" if best_key_hash is not None and self._store[best_key_hash].image_embedding is not None else "text-text"
 
@@ -488,9 +495,8 @@ class DiTCacheStore:
     def get_similarity_stats(self) -> dict:
         """Return distribution stats of all similarity values collected.
         Reads from a shared file so it can be called from any process."""
-        stats_path = "/tmp/cache_sim_stats.json"
         try:
-            with open(stats_path) as f:
+            with open(_SIM_STATS_PATH) as f:
                 return json.load(f)
         except Exception:
             return {"final_sim": {"total_comparisons": 0}, "t2t_sim": {"total_comparisons": 0}}
@@ -501,14 +507,13 @@ class DiTCacheStore:
             self._all_sims.clear()
             self._all_t2t_sims.clear()
         try:
-            with open("/tmp/cache_sim_stats.json", "w") as f:
+            with open(_SIM_STATS_PATH, "w") as f:
                 json.dump({"final_sim": {"total_comparisons": 0}, "t2t_sim": {"total_comparisons": 0}}, f)
         except Exception:
             pass
 
     def _flush_sim_stats_to_file(self) -> None:
         """Write current sim stats to a shared file (called from within lock)."""
-        import numpy as np
 
         def _compute_stats(values):
             if not values:
@@ -533,7 +538,7 @@ class DiTCacheStore:
             "t2t_sim": _compute_stats(self._all_t2t_sims),
         }
         try:
-            with open("/tmp/cache_sim_stats.json", "w") as f:
+            with open(_SIM_STATS_PATH, "w") as f:
                 json.dump(result, f)
         except Exception:
             pass
@@ -546,7 +551,7 @@ class DiTCacheStore:
     @property
     def memory_usage_mb(self) -> float:
         with self._lock:
-            return self._current_memory_bytes / 1024**2
+            return self._current_memory_bytes / _MB
 
     def clear(self):
         with self._lock:
@@ -569,18 +574,15 @@ class DiTCacheStore:
             return {
                 "entries": len(self._store),
                 "max_entries": self._max_entries,
-                "memory_mb": self._current_memory_bytes / 1024**2,
-                "max_memory_gb": self._max_memory_bytes / 1024**3,
+                "memory_mb": self._current_memory_bytes / _MB,
+                "max_memory_gb": self._max_memory_bytes / _GB,
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": self.hit_rate,
             }
 
     def save_to_disk(self, cache_dir: str | Path) -> int:
-        import os
-        from pathlib import Path as PathLib
-
-        cache_dir = PathLib(cache_dir)
+        cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         saved_count = 0
@@ -622,10 +624,8 @@ class DiTCacheStore:
                         meta["step_latents"] = step_data
                         meta["num_steps"] = len(step_data)
 
-                    import json as json_mod
-
                     with open(entry_dir / "meta.json", "w") as f:
-                        json_mod.dump(meta, f, indent=2)
+                        json.dump(meta, f, indent=2)
 
                     saved_count += 1
                 except Exception as e:
@@ -639,15 +639,12 @@ class DiTCacheStore:
             "Saved %d cache entries to %s (%.2f MB)",
             saved_count,
             cache_dir,
-            self._current_memory_bytes / 1024**2,
+            self._current_memory_bytes / _MB,
         )
         return saved_count
 
     def load_from_disk(self, cache_dir: str | Path) -> int:
-        import json as json_mod
-        from pathlib import Path as PathLib
-
-        cache_dir = PathLib(cache_dir)
+        cache_dir = Path(cache_dir)
         if not cache_dir.exists():
             logger.info("Cache directory %s does not exist, skipping load", cache_dir)
             return 0
@@ -666,7 +663,7 @@ class DiTCacheStore:
                     key_hash = entry_dir.name
 
                     with open(meta_file) as f:
-                        meta = json_mod.load(f)
+                        meta = json.load(f)
 
                     latents = torch.load(latent_file, map_location="cpu", weights_only=True)
 
@@ -712,7 +709,7 @@ class DiTCacheStore:
             "Loaded %d cache entries from %s (%.2f MB)",
             loaded_count,
             cache_dir,
-            self._current_memory_bytes / 1024**2,
+            self._current_memory_bytes / _MB,
         )
         return loaded_count
 

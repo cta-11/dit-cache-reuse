@@ -180,7 +180,7 @@ class InterRequestCacheBackend(CacheBackend):
             return None
 
     def encode_image(self, image_tensor: torch.Tensor) -> torch.Tensor | None:
-        if getattr(self, "_use_fgclip", True) or self._full_clip_model is None:
+        if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return None
         if self._clip_image_processor is None:
             return None
@@ -209,7 +209,7 @@ class InterRequestCacheBackend(CacheBackend):
     def update_image_embedding(self, cache_key_hash: str | None, image_tensor: torch.Tensor) -> None:
         if cache_key_hash is None:
             return
-        if getattr(self, "_use_fgclip", True) or self._full_clip_model is None:
+        if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return
         image_emb = self.encode_image(image_tensor)
         if image_emb is not None:
@@ -239,22 +239,10 @@ class InterRequestCacheBackend(CacheBackend):
         )
         return latents, step_latents, sim, cached_prompt, match_type
 
-    @staticmethod
-    def _compute_token_diff_ratio(query_prompt: str, cached_prompt: str) -> float:
-        query_tokens = set(query_prompt.lower().split())
-        cached_tokens = set(cached_prompt.lower().split())
-        if not cached_tokens:
-            return 1.0
-        diff_tokens = query_tokens.symmetric_difference(cached_tokens)
-        return len(diff_tokens) / (len(query_tokens) + len(cached_tokens))
-
     def compute_skip_steps(
         self,
         similarity: float,
         total_steps: int,
-        query_prompt: str | None = None,
-        cached_prompt: str | None = None,
-        match_type: str | None = None,
     ) -> int:
         if similarity < self._clip_threshold:
             return 0
