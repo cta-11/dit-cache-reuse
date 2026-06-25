@@ -79,7 +79,10 @@ class InterRequestCacheBackend(CacheBackend):
         self._clip_device = None
 
         logger.info(
-            "InterRequestCacheBackend initialized: max_entries=%d, max_memory_gb=%.1f, record_step_latents=%s, persistent_cache_dir=%s, clip_model_path=%s, clip_threshold=%.2f, clip_min_skip=%d, clip_max_skip_ratio=%.2f",
+            "InterRequestCacheBackend initialized: "
+            "max_entries=%d, max_memory_gb=%.1f, record_step_latents=%s, "
+            "persistent_cache_dir=%s, clip_model_path=%s, "
+            "clip_threshold=%.2f, clip_min_skip=%d, clip_max_skip_ratio=%.2f",
             max_entries,
             max_memory_gb,
             self._record_step_latents,

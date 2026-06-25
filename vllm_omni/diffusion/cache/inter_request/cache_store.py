@@ -332,7 +332,10 @@ class DiTCacheStore:
                         continue
                     if required_width is not None and entry.cache_key.width != required_width:
                         continue
-                    if required_num_inference_steps is not None and entry.cache_key.num_inference_steps < required_num_inference_steps:
+                    if (
+                        required_num_inference_steps is not None
+                        and entry.cache_key.num_inference_steps < required_num_inference_steps
+                    ):
                         continue
                 if entry.image_embedding is not None and entry.clip_embedding is not None:
                     hybrid_row_idxs.append(row_idx)
@@ -399,7 +402,10 @@ class DiTCacheStore:
             if self._search_count % _SIM_STATS_FLUSH_INTERVAL == 0:
                 self._flush_sim_stats_to_file()
 
-            match_type = "hybrid" if best_key_hash is not None and self._store[best_key_hash].image_embedding is not None else "text-text"
+            if best_key_hash is not None and self._store[best_key_hash].image_embedding is not None:
+                match_type = "hybrid"
+            else:
+                match_type = "text-text"
 
             if best_key_hash is None or best_sim < threshold:
                 self._misses += 1
@@ -442,7 +448,9 @@ class DiTCacheStore:
                 ]
 
             logger.info(
-                "CLIP semantic HIT [%s]: key=%s t2t=%.4f t2i=%.4f penalty=%.4f final=%.4f (threshold=%.2f, hits=%d, misses=%d)",
+                "CLIP semantic HIT [%s]: key=%s "
+                "t2t=%.4f t2i=%.4f penalty=%.4f final=%.4f "
+                "(threshold=%.2f, hits=%d, misses=%d)",
                 match_type,
                 best_key_hash[:8],
                 best_t2t,
