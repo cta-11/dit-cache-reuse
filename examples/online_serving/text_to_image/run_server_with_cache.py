@@ -21,7 +21,7 @@ import os
 import random
 import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Force unbuffered stdout so logs show immediately
 sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
@@ -69,6 +69,7 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
     def _handle_similarity_stats(self):
         try:
             import json as _json
+
             with open("/tmp/cache_sim_stats.json") as f:
                 stats = _json.load(f)
             self._send_json(200, stats)
@@ -80,6 +81,7 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
     def _handle_reset_similarity_stats(self):
         try:
             import json as _json
+
             with open("/tmp/cache_sim_stats.json", "w") as f:
                 _json.dump({"final_sim": {"total_comparisons": 0}, "t2t_sim": {"total_comparisons": 0}}, f)
             self._send_json(200, {"status": "ok"})
@@ -149,11 +151,14 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
                     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                     images.append({"b64_json": b64})
 
-        self._send_json(200, {
-            "created": int(time.time()),
-            "data": images,
-            "time_ms": elapsed * 1000,
-        })
+        self._send_json(
+            200,
+            {
+                "created": int(time.time()),
+                "data": images,
+                "time_ms": elapsed * 1000,
+            },
+        )
 
 
 def main():
@@ -170,13 +175,21 @@ def main():
     parser.add_argument("--max-memory-gb", type=float, default=800.0)
     parser.add_argument("--clip-model-path", default=None, help="Path to CLIP model for semantic matching")
     parser.add_argument("--clip-threshold", type=float, default=0.75, help="CLIP similarity threshold (tau)")
-    parser.add_argument("--clip-min-skip", type=int, default=5, help="Minimum skip steps when similarity just exceeds threshold")
-    parser.add_argument("--clip-max-skip-ratio", type=float, default=0.5, help="Max skip ratio of total steps when similarity=1.0")
+    parser.add_argument(
+        "--clip-min-skip", type=int, default=5, help="Minimum skip steps when similarity just exceeds threshold"
+    )
+    parser.add_argument(
+        "--clip-max-skip-ratio", type=float, default=0.5, help="Max skip ratio of total steps when similarity=1.0"
+    )
     # cache_dit parameters (used when cache-backend contains "cache_dit")
-    parser.add_argument("--fn-compute-blocks", type=int, default=1, help="cache_dit: number of blocks to fully compute each step")
+    parser.add_argument(
+        "--fn-compute-blocks", type=int, default=1, help="cache_dit: number of blocks to fully compute each step"
+    )
     parser.add_argument("--bn-compute-blocks", type=int, default=0, help="cache_dit: number of backward compute blocks")
     parser.add_argument("--max-warmup-steps", type=int, default=4, help="cache_dit: warmup steps before caching begins")
-    parser.add_argument("--residual-diff-threshold", type=float, default=0.24, help="cache_dit: residual difference threshold")
+    parser.add_argument(
+        "--residual-diff-threshold", type=float, default=0.24, help="cache_dit: residual difference threshold"
+    )
     args = parser.parse_args()
 
     from vllm_omni import Omni

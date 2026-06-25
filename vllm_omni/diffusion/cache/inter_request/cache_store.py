@@ -90,13 +90,13 @@ class DiTCacheStore:
         # updated incrementally on put()/update/evict.  Rows are lazily freed:
         # evicted rows are marked invalid and skipped during search, avoiding
         # costly matrix rebuilds on every eviction.
-        self._emb_dim: int | None = None        # embedding dim (set on first put)
-        self._txt_matrix: torch.Tensor | None = None   # [rows, dim] text embeddings
-        self._img_matrix: torch.Tensor | None = None   # [rows, dim] image embeddings (None row = absent)
-        self._row_keys: list[str | None] = []   # row_idx -> key_hash (None = freed row)
-        self._key_rows: dict[str, int] = {}     # key_hash -> row_idx
-        self._next_row: int = 0                 # next free row to append to
-        self._capacity: int = 0                 # allocated row capacity (grows in chunks)
+        self._emb_dim: int | None = None  # embedding dim (set on first put)
+        self._txt_matrix: torch.Tensor | None = None  # [rows, dim] text embeddings
+        self._img_matrix: torch.Tensor | None = None  # [rows, dim] image embeddings (None row = absent)
+        self._row_keys: list[str | None] = []  # row_idx -> key_hash (None = freed row)
+        self._key_rows: dict[str, int] = {}  # key_hash -> row_idx
+        self._next_row: int = 0  # next free row to append to
+        self._capacity: int = 0  # allocated row capacity (grows in chunks)
 
     # ---- Matrix maintenance helpers ----
     _ROW_CHUNK = 512  # rows to allocate per growth event
@@ -113,10 +113,8 @@ class DiTCacheStore:
             self._img_matrix = torch.zeros(new_cap, self._emb_dim)
         else:
             pad = new_cap - self._capacity
-            self._txt_matrix = torch.cat(
-                [self._txt_matrix, torch.zeros(pad, self._emb_dim)], dim=0)
-            self._img_matrix = torch.cat(
-                [self._img_matrix, torch.zeros(pad, self._emb_dim)], dim=0)
+            self._txt_matrix = torch.cat([self._txt_matrix, torch.zeros(pad, self._emb_dim)], dim=0)
+            self._img_matrix = torch.cat([self._img_matrix, torch.zeros(pad, self._emb_dim)], dim=0)
             # extend row_keys list
             self._row_keys.extend([None] * pad)
         self._capacity = new_cap
@@ -132,8 +130,7 @@ class DiTCacheStore:
         if self._emb_dim is None:
             self._emb_dim = emb.shape[0]
         elif emb.shape[0] != self._emb_dim:
-            logger.warning("Embedding dim mismatch: got %d, expected %d, skipping",
-                           emb.shape[0], self._emb_dim)
+            logger.warning("Embedding dim mismatch: got %d, expected %d, skipping", emb.shape[0], self._emb_dim)
             return
         self._ensure_capacity(1)
         row = self._next_row
@@ -172,9 +169,8 @@ class DiTCacheStore:
         return total
 
     def _evict_if_needed(self, required_bytes: int):
-        while (
-            len(self._store) >= self._max_entries
-            or (self._current_memory_bytes + required_bytes > self._max_memory_bytes and len(self._store) > 0)
+        while len(self._store) >= self._max_entries or (
+            self._current_memory_bytes + required_bytes > self._max_memory_bytes and len(self._store) > 0
         ):
             oldest_key, oldest_entry = self._store.popitem(last=False)
             freed = self._estimate_entry_bytes(oldest_entry)
@@ -349,12 +345,12 @@ class DiTCacheStore:
             # so cosine similarity = dot product directly — no re-normalization.
             if hybrid_row_idxs:
                 idx_t = torch.tensor(hybrid_row_idxs, dtype=torch.long)
-                txt_sub = self._txt_matrix.index_select(0, idx_t)   # [M, dim]
-                img_sub = self._img_matrix.index_select(0, idx_t)   # [M, dim]
-                t2t = (q_cpu * txt_sub).sum(dim=-1)                  # [M]
-                t2i = (q_cpu * img_sub).sum(dim=-1)                  # [M]
-                penalty = torch.sigmoid((t2i - 0.10) * 10)           # [M]
-                sims = t2t * penalty                                 # [M]
+                txt_sub = self._txt_matrix.index_select(0, idx_t)  # [M, dim]
+                img_sub = self._img_matrix.index_select(0, idx_t)  # [M, dim]
+                t2t = (q_cpu * txt_sub).sum(dim=-1)  # [M]
+                t2i = (q_cpu * img_sub).sum(dim=-1)  # [M]
+                penalty = torch.sigmoid((t2i - 0.10) * 10)  # [M]
+                sims = t2t * penalty  # [M]
 
                 self._all_sims.extend(sims.tolist())
                 self._all_t2t_sims.extend(t2t.tolist())
@@ -369,9 +365,9 @@ class DiTCacheStore:
             # --- Text-only group: sim = t2t ---
             if text_row_idxs:
                 idx_t = torch.tensor(text_row_idxs, dtype=torch.long)
-                txt_sub = self._txt_matrix.index_select(0, idx_t)   # [K, dim]
-                t2t = (q_cpu * txt_sub).sum(dim=-1)                  # [K]
-                sims = t2t                                           # sim == t2t for text-only
+                txt_sub = self._txt_matrix.index_select(0, idx_t)  # [K, dim]
+                t2t = (q_cpu * txt_sub).sum(dim=-1)  # [K]
+                sims = t2t  # sim == t2t for text-only
 
                 self._all_sims.extend(sims.tolist())
                 self._all_t2t_sims.extend(t2t.tolist())
@@ -411,7 +407,10 @@ class DiTCacheStore:
                 self._misses += 1
                 logger.info(
                     "CLIP semantic search: no match (t2t=%.4f, t2i=%.4f, penalty=%.4f, final=%.4f, threshold=%.2f)",
-                    best_t2t, best_t2i, best_penalty, best_sim,
+                    best_t2t,
+                    best_t2i,
+                    best_penalty,
+                    best_sim,
                     threshold,
                 )
                 return None, None, best_sim, None, None
@@ -681,9 +680,7 @@ class DiTCacheStore:
                         for step_info in meta["step_latents"]:
                             step_file = entry_dir / step_info["file"]
                             if step_file.exists():
-                                step_data = torch.load(
-                                    step_file, map_location="cpu", weights_only=True
-                                )
+                                step_data = torch.load(step_file, map_location="cpu", weights_only=True)
                                 step_latents.append(
                                     StepLatentData(
                                         step_index=step_data["step_index"],

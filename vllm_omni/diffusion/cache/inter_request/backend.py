@@ -8,7 +8,6 @@ import torch
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.inter_request.cache_store import (
-    CacheKey,
     DiTCacheStore,
     StepLatentData,
     build_cache_key_from_request,
@@ -125,12 +124,10 @@ class InterRequestCacheBackend(CacheBackend):
             config_path = Path(self._clip_model_path)
             fgclip_config = config_path / "modeling_fgclip.py"
             if fgclip_config.exists():
-                from transformers import AutoTokenizer, AutoModelForCausalLM
+                from transformers import AutoModelForCausalLM, AutoTokenizer
 
                 self._clip_tokenizer = AutoTokenizer.from_pretrained(self._clip_model_path)
-                self._clip_model = AutoModelForCausalLM.from_pretrained(
-                    self._clip_model_path, trust_remote_code=True
-                )
+                self._clip_model = AutoModelForCausalLM.from_pretrained(self._clip_model_path, trust_remote_code=True)
                 self._clip_model.to(self._clip_device)
                 self._clip_model.eval()
                 self._use_fgclip = True
@@ -189,7 +186,6 @@ class InterRequestCacheBackend(CacheBackend):
             return None
         try:
             from PIL import Image
-            import numpy as np
 
             img = image_tensor.float().cpu()
             if img.dim() == 4:
@@ -246,6 +242,9 @@ class InterRequestCacheBackend(CacheBackend):
         self,
         similarity: float,
         total_steps: int,
+        query_prompt: str | None = None,
+        cached_prompt: str | None = None,
+        match_type: str | None = None,
     ) -> int:
         if similarity < self._clip_threshold:
             return 0

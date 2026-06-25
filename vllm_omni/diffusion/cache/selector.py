@@ -34,14 +34,17 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
 
     if cache_backend == "cache_dit":
         from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
+
         return CacheDiTBackend(cache_config)
     elif cache_backend == "tea_cache":
         from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
+
         return TeaCacheBackend(cache_config)
     elif cache_backend == "inter_request":
         return InterRequestCacheBackend(cache_config)
     elif cache_backend in ("inter_request+cache_dit", "cache_dit+inter_request"):
         from vllm_omni.diffusion.cache.composite_backend import CompositeCacheBackend
+
         return CompositeCacheBackend(cache_config)
     else:
         raise ValueError(
