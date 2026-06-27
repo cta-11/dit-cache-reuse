@@ -101,10 +101,12 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
+        choices=["cache_dit", "tea_cache", "inter_request", "inter_request+cache_dit"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache), "
+            "'inter_request' (cross-request DiT state reuse, Chorus Stage-1), "
+            "'inter_request+cache_dit' (composite: cross-request reuse + intra-request block caching). "
             "Default: None (no cache acceleration)."
         ),
     )
@@ -112,6 +114,82 @@ def parse_args() -> argparse.Namespace:
         "--enable-cache-dit-summary",
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
+
+    # ---- inter_request cache parameters [inter_request only] ----
+    parser.add_argument(
+        "--persistent-cache-dir",
+        type=str,
+        default=None,
+        help="Directory to persist cache to disk for cross-run reuse (inter_request cache only). Default: None (in-memory only).",
+    )
+    parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=8000,
+        help="Maximum number of cache entries (inter_request cache only). Default: 8000.",
+    )
+    parser.add_argument(
+        "--max-memory-gb",
+        type=float,
+        default=800.0,
+        help="Maximum memory in GB for cached latents (inter_request cache only). Default: 800.",
+    )
+    parser.add_argument(
+        "--clip-model-path",
+        type=str,
+        default=None,
+        help="Path to CLIP model for semantic prompt matching (inter_request cache only). Default: None (exact match only).",
+    )
+    parser.add_argument(
+        "--clip-threshold",
+        type=float,
+        default=0.75,
+        help="CLIP similarity threshold for semantic matching (inter_request cache only). Default: 0.75.",
+    )
+    parser.add_argument(
+        "--clip-min-skip",
+        type=int,
+        default=5,
+        help="Minimum skip steps when similarity just exceeds threshold (inter_request cache only). Default: 5.",
+    )
+    parser.add_argument(
+        "--clip-max-skip-ratio",
+        type=float,
+        default=0.5,
+        help="Max skip ratio of total steps when similarity=1.0 (inter_request cache only). Default: 0.5.",
+    )
+    parser.add_argument(
+        "--resume-from-step",
+        type=int,
+        default=0,
+        help="Resume denoising from this step using cached step latents (inter_request cache only). 0 = no resume.",
+    )
+
+    # ---- cache_dit parameters (used when backend contains cache_dit) ----
+    parser.add_argument(
+        "--fn-compute-blocks",
+        type=int,
+        default=1,
+        help="cache_dit: number of blocks to fully compute each step. Default: 1.",
+    )
+    parser.add_argument(
+        "--bn-compute-blocks",
+        type=int,
+        default=0,
+        help="cache_dit: number of backward compute blocks. Default: 0.",
+    )
+    parser.add_argument(
+        "--max-warmup-steps",
+        type=int,
+        default=4,
+        help="cache_dit: warmup steps before caching begins. Default: 4.",
+    )
+    parser.add_argument(
+        "--residual-diff-threshold",
+        type=float,
+        default=0.24,
+        help="cache_dit: residual difference threshold. Default: 0.24.",
     )
     parser.add_argument(
         "--ulysses-degree",
@@ -341,6 +419,37 @@ def main():
             # Note: coefficients will use model-specific defaults based on model_type
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
+    elif cache_backend == "inter_request":
+        # Inter-request cache: cross-request DiT state reuse (Chorus Stage-1)
+        # Caches final latents + per-step latents for reuse across requests.
+        cache_config = {
+            "inter_request_max_entries": args.max_entries,
+            "inter_request_max_memory_gb": args.max_memory_gb,
+            "inter_request_persistent_cache_dir": args.persistent_cache_dir,
+        }
+        if args.clip_model_path:
+            cache_config["inter_request_clip_model_path"] = args.clip_model_path
+            cache_config["inter_request_clip_threshold"] = args.clip_threshold
+            cache_config["inter_request_clip_min_skip"] = args.clip_min_skip
+            cache_config["inter_request_clip_max_skip_ratio"] = args.clip_max_skip_ratio
+    elif cache_backend == "inter_request+cache_dit":
+        # Composite: cross-request reuse (inter_request) + intra-request block caching (cache_dit)
+        cache_config = {
+            # inter_request parameters
+            "inter_request_max_entries": args.max_entries,
+            "inter_request_max_memory_gb": args.max_memory_gb,
+            "inter_request_persistent_cache_dir": args.persistent_cache_dir,
+            # cache_dit parameters
+            "Fn_compute_blocks": args.fn_compute_blocks,
+            "Bn_compute_blocks": args.bn_compute_blocks,
+            "max_warmup_steps": args.max_warmup_steps,
+            "residual_diff_threshold": args.residual_diff_threshold,
+        }
+        if args.clip_model_path:
+            cache_config["inter_request_clip_model_path"] = args.clip_model_path
+            cache_config["inter_request_clip_threshold"] = args.clip_threshold
+            cache_config["inter_request_clip_min_skip"] = args.clip_min_skip
+            cache_config["inter_request_clip_max_skip_ratio"] = args.clip_max_skip_ratio
 
     profiler_enabled = args.profiler_config is not None
 
@@ -466,6 +575,7 @@ def main():
             guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_images_per_prompt,
+            resume_from_step=args.resume_from_step,
             extra_args=extra_args,
         ),
     )
