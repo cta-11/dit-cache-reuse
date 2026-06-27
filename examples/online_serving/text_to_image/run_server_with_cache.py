@@ -17,12 +17,21 @@ import base64
 import io
 import json
 import logging
+import os
 import random
+import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Force unbuffered stdout so logs show immediately
+sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
+sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 omni = None
@@ -60,6 +69,7 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
     def _handle_similarity_stats(self):
         try:
             import json as _json
+
             with open("/tmp/cache_sim_stats.json") as f:
                 stats = _json.load(f)
             self._send_json(200, stats)
@@ -71,6 +81,7 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
     def _handle_reset_similarity_stats(self):
         try:
             import json as _json
+
             with open("/tmp/cache_sim_stats.json", "w") as f:
                 _json.dump({"final_sim": {"total_comparisons": 0}, "t2t_sim": {"total_comparisons": 0}}, f)
             self._send_json(200, {"status": "ok"})
@@ -118,6 +129,8 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
         )
 
         start = time.perf_counter()
+        logger.info("=" * 60)
+        logger.info("REQUEST: prompt=%r seed=%d steps=%d", prompt[:80], seed, steps)
         try:
             outputs = omni.generate(prompt_dict, sampling_params)
         except Exception as e:
@@ -125,7 +138,8 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
             return
         elapsed = time.perf_counter() - start
-        logger.info("Generation completed in %.2fs", elapsed)
+        logger.info("COMPLETED in %.2fs", elapsed)
+        logger.info("=" * 60)
 
         images = []
         for out in outputs:
@@ -137,11 +151,14 @@ class CacheAwareHandler(BaseHTTPRequestHandler):
                     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                     images.append({"b64_json": b64})
 
-        self._send_json(200, {
-            "created": int(time.time()),
-            "data": images,
-            "time_ms": elapsed * 1000,
-        })
+        self._send_json(
+            200,
+            {
+                "created": int(time.time()),
+                "data": images,
+                "time_ms": elapsed * 1000,
+            },
+        )
 
 
 def main():
@@ -154,12 +171,28 @@ def main():
     parser.add_argument("--cache-backend", default="inter_request")
     parser.add_argument("--persistent-cache-dir", default="./persistent_cache")
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
-    parser.add_argument("--max-entries", type=int, default=1000)
-    parser.add_argument("--max-memory-gb", type=float, default=100.0)
+    parser.add_argument("--max-entries", type=int, default=8000)
+    parser.add_argument("--max-memory-gb", type=float, default=800.0)
     parser.add_argument("--clip-model-path", default=None, help="Path to CLIP model for semantic matching")
     parser.add_argument("--clip-threshold", type=float, default=0.75, help="CLIP similarity threshold (tau)")
-    parser.add_argument("--clip-min-skip", type=int, default=5, help="Minimum skip steps when similarity just exceeds threshold")
-    parser.add_argument("--clip-max-skip-ratio", type=float, default=0.5, help="Max skip ratio of total steps when similarity=1.0")
+    parser.add_argument(
+        "--clip-min-skip", type=int, default=5, help="Minimum skip steps when similarity just exceeds threshold"
+    )
+    parser.add_argument(
+        "--clip-max-skip-ratio", type=float, default=0.5, help="Max skip ratio of total steps when similarity=1.0"
+    )
+    parser.add_argument(
+        "--no-t2i-penalty", action="store_true", help="Disable t2i sigmoid penalty (use text-only similarity)"
+    )
+    # cache_dit parameters (used when cache-backend contains "cache_dit")
+    parser.add_argument(
+        "--fn-compute-blocks", type=int, default=1, help="cache_dit: number of blocks to fully compute each step"
+    )
+    parser.add_argument("--bn-compute-blocks", type=int, default=0, help="cache_dit: number of backward compute blocks")
+    parser.add_argument("--max-warmup-steps", type=int, default=4, help="cache_dit: warmup steps before caching begins")
+    parser.add_argument(
+        "--residual-diff-threshold", type=float, default=0.24, help="cache_dit: residual difference threshold"
+    )
     args = parser.parse_args()
 
     from vllm_omni import Omni
@@ -177,6 +210,14 @@ def main():
         cache_config["inter_request_clip_threshold"] = args.clip_threshold
         cache_config["inter_request_clip_min_skip"] = args.clip_min_skip
         cache_config["inter_request_clip_max_skip_ratio"] = args.clip_max_skip_ratio
+    cache_config["inter_request_use_t2i_penalty"] = not args.no_t2i_penalty
+
+    # Add cache_dit parameters when backend contains cache_dit
+    if "cache_dit" in args.cache_backend:
+        cache_config["Fn_compute_blocks"] = args.fn_compute_blocks
+        cache_config["Bn_compute_blocks"] = args.bn_compute_blocks
+        cache_config["max_warmup_steps"] = args.max_warmup_steps
+        cache_config["residual_diff_threshold"] = args.residual_diff_threshold
 
     logger.info("Initializing Omni engine...")
     logger.info("  Model: %s", args.model)
@@ -190,6 +231,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         mode="text-to-image",
         init_timeout=3600,
+        enable_cache_dit_summary=True,
     )
 
     server = HTTPServer((args.host, args.port), CacheAwareHandler)

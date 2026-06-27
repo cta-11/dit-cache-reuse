@@ -8,7 +8,6 @@ import torch
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.inter_request.cache_store import (
-    CacheKey,
     DiTCacheStore,
     StepLatentData,
     build_cache_key_from_request,
@@ -74,12 +73,17 @@ class InterRequestCacheBackend(CacheBackend):
         self._clip_threshold = float(getattr(config, "inter_request_clip_threshold", 0.75))
         self._clip_min_skip = int(getattr(config, "inter_request_clip_min_skip", 5))
         self._clip_max_skip_ratio = float(getattr(config, "inter_request_clip_max_skip_ratio", 0.5))
+        self._use_t2i_penalty = bool(getattr(config, "inter_request_use_t2i_penalty", True))
+        self._cache_store.set_t2i_penalty(self._use_t2i_penalty)
         self._clip_tokenizer = None
         self._clip_model = None
         self._clip_device = None
 
         logger.info(
-            "InterRequestCacheBackend initialized: max_entries=%d, max_memory_gb=%.1f, record_step_latents=%s, persistent_cache_dir=%s, clip_model_path=%s, clip_threshold=%.2f, clip_min_skip=%d, clip_max_skip_ratio=%.2f",
+            "InterRequestCacheBackend initialized: "
+            "max_entries=%d, max_memory_gb=%.1f, record_step_latents=%s, "
+            "persistent_cache_dir=%s, clip_model_path=%s, "
+            "clip_threshold=%.2f, clip_min_skip=%d, clip_max_skip_ratio=%.2f",
             max_entries,
             max_memory_gb,
             self._record_step_latents,
@@ -122,12 +126,10 @@ class InterRequestCacheBackend(CacheBackend):
             config_path = Path(self._clip_model_path)
             fgclip_config = config_path / "modeling_fgclip.py"
             if fgclip_config.exists():
-                from transformers import AutoTokenizer, AutoModelForCausalLM
+                from transformers import AutoModelForCausalLM, AutoTokenizer
 
                 self._clip_tokenizer = AutoTokenizer.from_pretrained(self._clip_model_path)
-                self._clip_model = AutoModelForCausalLM.from_pretrained(
-                    self._clip_model_path, trust_remote_code=True
-                )
+                self._clip_model = AutoModelForCausalLM.from_pretrained(self._clip_model_path, trust_remote_code=True)
                 self._clip_model.to(self._clip_device)
                 self._clip_model.eval()
                 self._use_fgclip = True
@@ -180,13 +182,12 @@ class InterRequestCacheBackend(CacheBackend):
             return None
 
     def encode_image(self, image_tensor: torch.Tensor) -> torch.Tensor | None:
-        if getattr(self, "_use_fgclip", True) or self._full_clip_model is None:
+        if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return None
         if self._clip_image_processor is None:
             return None
         try:
             from PIL import Image
-            import numpy as np
 
             img = image_tensor.float().cpu()
             if img.dim() == 4:
@@ -209,7 +210,7 @@ class InterRequestCacheBackend(CacheBackend):
     def update_image_embedding(self, cache_key_hash: str | None, image_tensor: torch.Tensor) -> None:
         if cache_key_hash is None:
             return
-        if getattr(self, "_use_fgclip", True) or self._full_clip_model is None:
+        if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return
         image_emb = self.encode_image(image_tensor)
         if image_emb is not None:
@@ -238,15 +239,6 @@ class InterRequestCacheBackend(CacheBackend):
             required_num_inference_steps=cache_key.num_inference_steps,
         )
         return latents, step_latents, sim, cached_prompt, match_type
-
-    @staticmethod
-    def _compute_token_diff_ratio(query_prompt: str, cached_prompt: str) -> float:
-        query_tokens = set(query_prompt.lower().split())
-        cached_tokens = set(cached_prompt.lower().split())
-        if not cached_tokens:
-            return 1.0
-        diff_tokens = query_tokens.symmetric_difference(cached_tokens)
-        return len(diff_tokens) / (len(query_tokens) + len(cached_tokens))
 
     def compute_skip_steps(
         self,
@@ -286,7 +278,7 @@ class InterRequestCacheBackend(CacheBackend):
                 self._persistent_cache_dir,
             )
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True, **kwargs: Any) -> None:
         pass
 
     def before_forward(self, is_dummy: bool = False) -> None:

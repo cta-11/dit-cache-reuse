@@ -335,7 +335,12 @@ class DiffusionModelRunner:
                 and self.cache_backend.is_enabled()
                 and req.sampling_params.num_inference_steps is not None
             ):
-                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
+                _resume_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+                self.cache_backend.refresh(
+                    self.pipeline,
+                    req.sampling_params.num_inference_steps,
+                    resume_from_step=_resume_step,
+                )
 
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
@@ -394,7 +399,7 @@ class DiffusionModelRunner:
             if (
                 self.cache_backend is not None
                 and self.cache_backend.is_enabled()
-                and self.od_config.cache_backend == "cache_dit"
+                and self.od_config.cache_backend in ("cache_dit", "inter_request+cache_dit", "cache_dit+inter_request")
                 and self.od_config.enable_cache_dit_summary
             ):
                 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
