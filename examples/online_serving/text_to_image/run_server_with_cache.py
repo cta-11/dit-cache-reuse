@@ -181,6 +181,9 @@ def main():
     parser.add_argument(
         "--clip-max-skip-ratio", type=float, default=0.5, help="Max skip ratio of total steps when similarity=1.0"
     )
+    parser.add_argument(
+        "--no-t2i-penalty", action="store_true", help="Disable t2i sigmoid penalty (use text-only similarity)"
+    )
     # cache_dit parameters (used when cache-backend contains "cache_dit")
     parser.add_argument(
         "--fn-compute-blocks", type=int, default=1, help="cache_dit: number of blocks to fully compute each step"
@@ -207,6 +210,7 @@ def main():
         cache_config["inter_request_clip_threshold"] = args.clip_threshold
         cache_config["inter_request_clip_min_skip"] = args.clip_min_skip
         cache_config["inter_request_clip_max_skip_ratio"] = args.clip_max_skip_ratio
+    cache_config["inter_request_use_t2i_penalty"] = not args.no_t2i_penalty
 
     # Add cache_dit parameters when backend contains cache_dit
     if "cache_dit" in args.cache_backend:

@@ -1279,7 +1279,7 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True, **kwargs: Any) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context with new num_inference_steps.
 
         This method updates the cache context when num_inference_steps changes

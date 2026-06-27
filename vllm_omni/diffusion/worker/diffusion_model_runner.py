@@ -195,13 +195,11 @@ class DiffusionModelRunner:
         # Copy tensor to CPU before async to avoid NPU synchronization issues
         image_tensor_cpu = image_tensor.detach().clone().cpu()
         import threading
-
         def _worker():
             try:
                 self.cache_backend.update_image_embedding(cache_key_hash, image_tensor_cpu)
             except Exception as e:
                 logger.debug("Failed to update image embedding: %s", e)
-
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
@@ -303,8 +301,9 @@ class DiffusionModelRunner:
                         return DiffusionOutput(output=cached_output)
 
                     if self.cache_backend.clip_enabled:
-                        clip_result = self.cache_backend.semantic_lookup(req, target_device=self.device)
-                        clip_latents, clip_step_latents, clip_sim, clip_cached_prompt, clip_match_type = clip_result
+                        clip_latents, clip_step_latents, clip_sim, clip_cached_prompt, clip_match_type = self.cache_backend.semantic_lookup(
+                            req, target_device=self.device
+                        )
                         if clip_latents is not None and clip_step_latents is not None:
                             total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
                             current_prompt = ""
@@ -313,8 +312,7 @@ class DiffusionModelRunner:
                             elif req.prompts and isinstance(req.prompts[0], str):
                                 current_prompt = req.prompts[0]
                             clip_resume_step = self.cache_backend.compute_skip_steps(
-                                clip_sim,
-                                total_steps,
+                                clip_sim, total_steps,
                                 query_prompt=current_prompt,
                                 cached_prompt=clip_cached_prompt,
                                 match_type=clip_match_type,
@@ -380,7 +378,9 @@ class DiffusionModelRunner:
                         )
                         for r in recorder.records
                     ]
-                cache_key_hash = self.cache_backend.store(req, output.output, step_latents=step_latents_data)
+                cache_key_hash = self.cache_backend.store(
+                    req, output.output, step_latents=step_latents_data
+                )
                 if cache_key_hash is not None:
                     output.custom_output["cache_key_hash"] = cache_key_hash
                     self._update_cache_image_embedding(cache_key_hash, output.output)
@@ -395,6 +395,7 @@ class DiffusionModelRunner:
                         saved_paths[0] if saved_paths else "",
                     )
 
+            # NOTE:
             if (
                 self.cache_backend is not None
                 and self.cache_backend.is_enabled()
@@ -402,7 +403,6 @@ class DiffusionModelRunner:
                 and self.od_config.enable_cache_dit_summary
             ):
                 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
-
                 cache_summary(self.pipeline, details=True)
 
             return output
@@ -522,5 +522,8 @@ class DiffusionModelRunner:
             self.cache_backend,
             type(self.cache_backend).__name__ if self.cache_backend else None,
         )
-        if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+        if (
+            isinstance(self.cache_backend, InterRequestCacheBackend)
+            and self.cache_backend.is_enabled()
+        ):
             self.cache_backend.shutdown()

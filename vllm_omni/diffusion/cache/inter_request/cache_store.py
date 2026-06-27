@@ -83,6 +83,7 @@ class DiTCacheStore:
         self._all_sims: list[float] = []  # all final_sim values across all queries
         self._all_t2t_sims: list[float] = []  # all t2t_sim values across all queries
         self._search_count: int = 0  # throttle for _flush_sim_stats_to_file
+        self._use_t2i_penalty: bool = True  # enable t2i sigmoid penalty in hybrid matching
 
         # ---- Pre-stacked embedding matrices for fast vectorized retrieval ----
         # Instead of torch.stack()-ing all embeddings on every semantic_search()
@@ -97,6 +98,11 @@ class DiTCacheStore:
         self._key_rows: dict[str, int] = {}  # key_hash -> row_idx
         self._next_row: int = 0  # next free row to append to
         self._capacity: int = 0  # allocated row capacity (grows in chunks)
+
+    def set_t2i_penalty(self, enabled: bool) -> None:
+        """Enable or disable t2i sigmoid penalty in hybrid matching."""
+        self._use_t2i_penalty = enabled
+        logger.info("t2i penalty %s", "enabled" if enabled else "disabled")
 
     # ---- Matrix maintenance helpers ----
     _ROW_CHUNK = 512  # rows to allocate per growth event
@@ -349,7 +355,10 @@ class DiTCacheStore:
                 img_sub = self._img_matrix.index_select(0, idx_t)  # [M, dim]
                 t2t = (q_cpu * txt_sub).sum(dim=-1)  # [M]
                 t2i = (q_cpu * img_sub).sum(dim=-1)  # [M]
-                penalty = torch.sigmoid((t2i - 0.10) * 10)  # [M]
+                if self._use_t2i_penalty:
+                    penalty = torch.sigmoid((t2i - 0.10) * 10)  # [M]
+                else:
+                    penalty = torch.ones_like(t2t)  # no t2i penalty
                 sims = t2t * penalty  # [M]
 
                 self._all_sims.extend(sims.tolist())

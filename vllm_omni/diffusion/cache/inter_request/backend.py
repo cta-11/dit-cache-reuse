@@ -73,6 +73,8 @@ class InterRequestCacheBackend(CacheBackend):
         self._clip_threshold = float(getattr(config, "inter_request_clip_threshold", 0.75))
         self._clip_min_skip = int(getattr(config, "inter_request_clip_min_skip", 5))
         self._clip_max_skip_ratio = float(getattr(config, "inter_request_clip_max_skip_ratio", 0.5))
+        self._use_t2i_penalty = bool(getattr(config, "inter_request_use_t2i_penalty", True))
+        self._cache_store.set_t2i_penalty(self._use_t2i_penalty)
         self._clip_tokenizer = None
         self._clip_model = None
         self._clip_device = None
