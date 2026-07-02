@@ -301,9 +301,8 @@ class DiffusionModelRunner:
                         return DiffusionOutput(output=cached_output)
 
                     if self.cache_backend.clip_enabled:
-                        clip_latents, clip_step_latents, clip_sim, clip_cached_prompt, clip_match_type = self.cache_backend.semantic_lookup(
-                            req, target_device=self.device
-                        )
+                        clip_result = self.cache_backend.semantic_lookup(req, target_device=self.device)
+                        clip_latents, clip_step_latents, clip_sim, clip_cached_prompt, clip_match_type = clip_result
                         if clip_latents is not None and clip_step_latents is not None:
                             total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
                             current_prompt = ""
